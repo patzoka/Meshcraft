@@ -86,7 +86,12 @@ h1 { font: 600 27px "Segoe UI", sans-serif; letter-spacing: -.9px; margin-bottom
 .metric strong.good { color: var(--green); }
 .metric strong.bad { color: #efae83; }
 
-.settings-panel { border-left: 1px solid var(--line); background: #151b24; padding: 18px 18px 12px; display: flex; flex-direction: column; min-height: 0; overflow: hidden; }
+.settings-panel { border-left: 1px solid var(--line); background: #151b24; padding: 18px 18px 12px; display: flex; flex-direction: column; min-height: 0; overflow-x: hidden; overflow-y: auto; scrollbar-gutter: stable; scrollbar-width: thin; scrollbar-color: #3a4554 transparent; }
+.settings-panel > * { flex-shrink: 0; }
+.settings-panel::-webkit-scrollbar { width: 8px; }
+.settings-panel::-webkit-scrollbar-track { background: transparent; }
+.settings-panel::-webkit-scrollbar-thumb { background: #3a4554; border-radius: 4px; border: 2px solid #151b24; }
+.settings-panel::-webkit-scrollbar-thumb:hover { background: #4b5869; }
 .panel-header { display: flex; align-items: center; justify-content: space-between; }
 .panel-header .eyebrow { margin-bottom: 6px; }
 .panel-header h2 { font-size: 19px; margin-bottom: 0; }

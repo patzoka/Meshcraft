@@ -20,11 +20,11 @@ import {
   inspectMesh,
   loadMesh,
   newDefaultSettings,
-  repairMesh,
   type MeshReport,
   type RepairSummary,
   type RepairSettings,
 } from "./mesh";
+import { repairInBackground } from "./repairClient";
 
 interface ViewPose {
   viewKey: string;
@@ -256,9 +256,8 @@ export default function App() {
     if (!original) return;
     setBusy(true);
     setMessage("");
-    await new Promise((resolve) => window.setTimeout(resolve, 0));
     try {
-      const result = repairMesh(original, settings);
+      const result = await repairInBackground(original, settings);
       const report = inspectMesh(result.geometry);
       repairedRef.current?.dispose();
       repairedRef.current = result.geometry;
@@ -439,6 +438,23 @@ export default function App() {
                 {repairSummary.weldedVertices} vertices welded · {repairSummary.removedTriangles} degenerate faces removed ·{" "}
                 {repairSummary.cappedHoles} holes capped ({repairSummary.cappedBoundaryEdges} boundary edges)
               </span>
+              {(repairSummary.patchVertices > 0 || repairSummary.preservedRims > 0) && (
+                <span>
+                  {formatNumber(repairSummary.patchVertices)} patch vertices added · {repairSummary.preservedRims} open rims kept
+                </span>
+              )}
+              {repairSummary.fallbackHoles > 0 && (
+                <span className="repair-summary-hint">
+                  {repairSummary.fallbackHoles} holes could not take an edge-flow patch and were capped flat instead.
+                </span>
+              )}
+              {repairSummary.skippedHoles.length > 0 && (
+                <span className="repair-summary-hint">
+                  {repairSummary.skippedHoles.length} openings left open:{" "}
+                  {repairSummary.skippedHoles.slice(0, 4).map((hole) => `${hole.edges} edges, ${hole.reason}`).join("; ")}
+                  {repairSummary.skippedHoles.length > 4 ? `; and ${repairSummary.skippedHoles.length - 4} more` : ""}.
+                </span>
+              )}
               {repairSummary.wallThicknessEnabled && (
                 <span>{formatNumber(repairSummary.thickenedFaces)} faces thickened ({repairSummary.thicknessScope === "all" ? "all surfaces" : "open-boundary components"})</span>
               )}
@@ -489,6 +505,58 @@ export default function App() {
             </label>
           </div>
 
+          {settings.closeHoles && (
+            <div className="settings-section">
+              <div className="settings-heading">
+                <h3>Hole filling</h3>
+                <span>PATCH SHAPE</span>
+              </div>
+              {([
+                ["planar", "Flat cap", "Fast. Triangulates the opening on its best-fit plane, with no new vertices."],
+                ["edge-flow", "Edge flow", "Builds a patch that matches the surrounding triangle size and continues the surface's curvature."],
+              ] as const).map(([method, label, description]) => (
+                <label key={method} className={`coverage-option ${settings.holeFillMethod === method ? "selected" : ""}`}>
+                  <input
+                    type="radio"
+                    name="hole-fill-method"
+                    checked={settings.holeFillMethod === method}
+                    onChange={() => updateSetting("holeFillMethod", method)}
+                  />
+                  <span><strong>{label}</strong><small>{description}</small></span>
+                </label>
+              ))}
+              {settings.holeFillMethod === "edge-flow" && (
+                <label className="toggle-row">
+                  <span><strong>Smooth patches</strong><small>Curve patches to follow the surface; off keeps them flat</small></span>
+                  <input type="checkbox" checked={settings.fairHoles} onChange={(event) => updateSetting("fairHoles", event.target.checked)} />
+                </label>
+              )}
+              <label className="toggle-row">
+                <span><strong>Keep outer rims open</strong><small>Don't seal the outside edge of open surfaces</small></span>
+                <input type="checkbox" checked={settings.keepOuterRim} onChange={(event) => updateSetting("keepOuterRim", event.target.checked)} />
+              </label>
+            </div>
+          )}
+
+          {settings.closeHoles && settings.keepOuterRim && (
+            <div className="settings-section slider-section">
+              <div className="slider-label">
+                <div><strong>Hole size vs rim</strong><small>Largest hole to fill, as a share of the rim</small></div>
+                <code>{Math.round(settings.maxHoleRatio * 100)}%</code>
+              </div>
+              <input
+                type="range"
+                min="0.05"
+                max="1"
+                step="0.05"
+                value={settings.maxHoleRatio}
+                onChange={(event) => updateSetting("maxHoleRatio", Number(event.target.value))}
+                aria-label="Largest hole perimeter as a share of the outer rim"
+              />
+              <div className="range-labels"><span>Small holes only</span><span>Up to rim size</span></div>
+            </div>
+          )}
+
           <div className="settings-section slider-section">
             <div className="slider-label">
               <div><strong>Weld tolerance</strong><small>Distance in millimeters</small></div>
@@ -515,7 +583,7 @@ export default function App() {
             <input
               type="range"
               min="3"
-              max="240"
+              max="1000"
               step="1"
               value={settings.maxHoleEdges}
               onChange={(event) => updateSetting("maxHoleEdges", Number(event.target.value))}

@@ -3,12 +3,11 @@ import {
   BufferGeometry,
   Mesh,
   Object3D,
-  ShapeUtils,
-  Vector2,
   Vector3,
 } from "three";
 import { mergeVertices } from "three/examples/jsm/utils/BufferGeometryUtils.js";
 import { unzipSync } from "fflate";
+import { fillHoles, type SkippedHole } from "./holeFill";
 
 export interface MeshReport {
   triangles: number;
@@ -26,6 +25,10 @@ export interface RepairSettings {
   weldVertices: boolean;
   removeDegenerate: boolean;
   closeHoles: boolean;
+  holeFillMethod: "planar" | "edge-flow";
+  keepOuterRim: boolean;
+  maxHoleRatio: number;
+  fairHoles: boolean;
   maxHoleEdges: number;
   weldTolerance: number;
   addWallThickness: boolean;
@@ -40,6 +43,10 @@ export interface RepairSummary {
   cappedHoles: number;
   cappedBoundaryEdges: number;
   remainingBoundaryEdges: number;
+  patchVertices: number;
+  preservedRims: number;
+  fallbackHoles: number;
+  skippedHoles: SkippedHole[];
   thickenedFaces: number;
   wallThicknessEnabled: boolean;
   wallThicknessMm: number;
@@ -71,6 +78,10 @@ const DEFAULT_SETTINGS: RepairSettings = {
   weldVertices: true,
   removeDegenerate: true,
   closeHoles: true,
+  holeFillMethod: "planar",
+  keepOuterRim: true,
+  maxHoleRatio: 0.5,
+  fairHoles: true,
   maxHoleEdges: 240,
   weldTolerance: 0.05,
   addWallThickness: true,
@@ -283,102 +294,6 @@ function removeDegenerateTriangles(geometry: BufferGeometry): BufferGeometry {
   return makePositionGeometry(kept);
 }
 
-function boundaryLoops(topology: Topology): number[][] {
-  const adjacent = new Map<number, number[]>();
-  const edgeKey = (a: number, b: number) => a < b ? `${a}:${b}` : `${b}:${a}`;
-  for (const { start, end } of topology.boundary) {
-    adjacent.set(start, [...(adjacent.get(start) ?? []), end]);
-    adjacent.set(end, [...(adjacent.get(end) ?? []), start]);
-  }
-  const unused = new Set(topology.boundary.map(({ start, end }) => edgeKey(start, end)));
-  const loops: number[][] = [];
-
-  for (const edge of topology.boundary) {
-    if (!unused.has(edgeKey(edge.start, edge.end))) continue;
-    const loop = [edge.start];
-    let previous = edge.start;
-    let current = edge.end;
-    unused.delete(edgeKey(previous, current));
-    let closed = false;
-    while (loop.length <= topology.boundary.length) {
-      if (current === loop[0]) {
-        closed = true;
-        break;
-      }
-      loop.push(current);
-      const nextOptions = (adjacent.get(current) ?? []).filter((next) =>
-        next !== previous && unused.has(edgeKey(current, next)),
-      );
-      if (nextOptions.length !== 1) break;
-      const next = nextOptions[0];
-      unused.delete(edgeKey(current, next));
-      previous = current;
-      current = next;
-    }
-    if (closed && loop.length >= 3) loops.push(loop);
-  }
-  return loops;
-}
-
-function closeSmallHoles(
-  geometry: BufferGeometry,
-  maxEdges: number,
-): { geometry: BufferGeometry; cappedHoles: number; cappedBoundaryEdges: number } {
-  if (maxEdges < 3) return { geometry, cappedHoles: 0, cappedBoundaryEdges: 0 };
-  const topology = topologyOf(geometry);
-  const position = geometry.getAttribute("position");
-  const triangles: number[] = [];
-  let cappedHoles = 0;
-  let cappedBoundaryEdges = 0;
-  const faceIndexCount = geometry.index?.count ?? position.count;
-  for (let i = 0; i < faceIndexCount; i++) {
-    const vertex = getIndex(geometry, i);
-    triangles.push(position.getX(vertex), position.getY(vertex), position.getZ(vertex));
-  }
-
-  for (const loop of boundaryLoops(topology)) {
-    if (loop.length > maxEdges) continue;
-    const points = loop.map((id) => topology.positions[id]);
-    const center = points.reduce((sum, point) => sum.add(point), new Vector3()).multiplyScalar(1 / points.length);
-    const normal = new Vector3();
-    for (let i = 0; i < points.length; i++) {
-      const a = points[i];
-      const b = points[(i + 1) % points.length];
-      normal.x += (a.y - b.y) * (a.z + b.z);
-      normal.y += (a.z - b.z) * (a.x + b.x);
-      normal.z += (a.x - b.x) * (a.y + b.y);
-    }
-    if (normal.lengthSq() <= topology.tolerance ** 2) continue;
-    normal.normalize();
-    const axis = Math.abs(normal.x) < 0.8 ? new Vector3(1, 0, 0) : new Vector3(0, 1, 0);
-    const basisX = new Vector3().crossVectors(axis, normal).normalize();
-    const basisY = new Vector3().crossVectors(normal, basisX).normalize();
-    const contour = points.map((point) => {
-      const relative = point.clone().sub(center);
-      return new Vector2(relative.dot(basisX), relative.dot(basisY));
-    });
-    const contourArea = ShapeUtils.area(contour);
-    if (Math.abs(contourArea) <= topology.tolerance ** 2) continue;
-    const capTriangles = ShapeUtils.triangulateShape(contour, []);
-    if (capTriangles.length === 0) continue;
-    const reversed = contourArea > 0;
-    for (const triangle of capTriangles) {
-      const ordered = reversed ? [...triangle].reverse() : triangle;
-      for (const index of ordered) {
-        const point = points[index];
-        triangles.push(point.x, point.y, point.z);
-      }
-    }
-    cappedHoles++;
-    cappedBoundaryEdges += loop.length;
-  }
-  return {
-    geometry: makePositionGeometry(triangles),
-    cappedHoles,
-    cappedBoundaryEdges,
-  };
-}
-
 function splitBoundaryComponents(geometry: BufferGeometry): {
   open: BufferGeometry;
   closed: BufferGeometry;
@@ -519,12 +434,26 @@ export function repairMesh(
   const removedTriangles = Math.max(0, beforeDegenerateRemoval - topologyOf(geometry).report.triangles);
   let cappedHoles = 0;
   let cappedBoundaryEdges = 0;
+  let patchVertices = 0;
+  let preservedRims = 0;
+  let fallbackHoles = 0;
+  const skippedHoles: SkippedHole[] = [];
   let thickenedFaces = 0;
   const closeHoles = (target: BufferGeometry) => {
     if (!settings.closeHoles) return target;
-    const result = closeSmallHoles(target, Math.floor(settings.maxHoleEdges));
+    const result = fillHoles(target, {
+      method: settings.holeFillMethod,
+      maxHoleEdges: Math.floor(settings.maxHoleEdges),
+      keepOuterRim: settings.keepOuterRim,
+      maxHoleRatio: settings.maxHoleRatio,
+      fair: settings.fairHoles,
+    });
     cappedHoles += result.cappedHoles;
     cappedBoundaryEdges += result.cappedBoundaryEdges;
+    patchVertices += result.patchVertices;
+    preservedRims += result.preservedRims;
+    fallbackHoles += result.fallbackHoles;
+    skippedHoles.push(...result.skippedHoles);
     if (result.geometry !== target) target.dispose();
     return result.geometry;
   };
@@ -572,6 +501,10 @@ export function repairMesh(
     cappedHoles,
     cappedBoundaryEdges,
     remainingBoundaryEdges,
+    patchVertices,
+    preservedRims,
+    fallbackHoles,
+    skippedHoles,
     thickenedFaces,
     wallThicknessEnabled: settings.addWallThickness,
     wallThicknessMm: settings.wallThicknessMm,
