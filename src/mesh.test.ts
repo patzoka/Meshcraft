@@ -232,4 +232,43 @@ describe("mesh diagnostics and repair", () => {
     expect(repaired.geometry.boundingBox!.max.x).toBeGreaterThan(1);
     expect(repaired.summary.thicknessScope).toBe("all");
   });
+
+  describe("generated face flags", () => {
+    const faceCount = (geometry: BufferGeometry) =>
+      (geometry.index?.count ?? geometry.getAttribute("position").count) / 3;
+    const countFlags = (flags: Uint8Array) => flags.reduce((sum, flag) => sum + flag, 0);
+    const base = { ...newDefaultSettings(), weldTolerance: 1e-5, keepOuterRim: false, maxHoleEdges: 80 };
+
+    it("flags only the hole patch when capping", () => {
+      const repaired = repairMesh(openCube(), { ...base, closeHoles: true, addWallThickness: false });
+      expect(repaired.generatedFaces.length).toBe(faceCount(repaired.geometry));
+      expect(Array.from(repaired.generatedFaces.slice(0, 10))).toEqual(new Array(10).fill(0));
+      expect(countFlags(repaired.generatedFaces)).toBe(2);
+    });
+
+    it("flags rim walls but not offset shells when thickening", () => {
+      const repaired = repairMesh(openCube(), { ...base, closeHoles: false, addWallThickness: true });
+      expect(repaired.generatedFaces.length).toBe(faceCount(repaired.geometry));
+      // The open square has 4 boundary edges, each bridged by two wall triangles.
+      expect(countFlags(repaired.generatedFaces)).toBe(8);
+    });
+
+    it("keeps flags aligned in single-sided mode", () => {
+      const repaired = repairMesh(openCube(), {
+        ...base,
+        closeHoles: true,
+        addWallThickness: true,
+        thicknessScope: "single-sided",
+      });
+      expect(repaired.generatedFaces.length).toBe(faceCount(repaired.geometry));
+      // The patch closes the cube before thickening, so both of its offset copies stay flagged.
+      expect(countFlags(repaired.generatedFaces)).toBe(4);
+    });
+
+    it("flags nothing when no repair adds faces", () => {
+      const repaired = repairMesh(new BoxGeometry(1, 1, 1), base);
+      expect(repaired.generatedFaces.length).toBe(faceCount(repaired.geometry));
+      expect(countFlags(repaired.generatedFaces)).toBe(0);
+    });
+  });
 });

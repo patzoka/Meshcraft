@@ -28,7 +28,14 @@ function repairHere(source: BufferGeometry, settings: RepairSettings): Promise<R
   return new Promise((resolve, reject) => {
     window.setTimeout(() => {
       try {
-        resolve(repairMesh(source, settings));
+        const result = repairMesh(source, settings);
+        // Match the worker path: one vertex triple per face, so face flags line up with vertices.
+        if (result.geometry.index) {
+          const flat = result.geometry.toNonIndexed();
+          result.geometry.dispose();
+          result.geometry = finish(flat);
+        }
+        resolve(result);
       } catch (error) {
         reject(error);
       }
@@ -63,7 +70,7 @@ export function repairInBackground(source: BufferGeometry, settings: RepairSetti
       }
       const geometry = new BufferGeometry();
       geometry.setAttribute("position", new BufferAttribute(event.data.positions, 3));
-      resolve({ geometry: finish(geometry), summary: event.data.summary });
+      resolve({ geometry: finish(geometry), summary: event.data.summary, generatedFaces: event.data.generatedFaces });
     };
     const onError = (event: ErrorEvent) => {
       event.preventDefault();

@@ -8,7 +8,7 @@ export interface RepairRequest {
 }
 
 export type RepairResponse =
-  | { id: number; positions: Float32Array; summary: RepairSummary }
+  | { id: number; positions: Float32Array; generatedFaces: Uint8Array; summary: RepairSummary }
   | { id: number; error: string };
 
 const scope = self as unknown as {
@@ -20,10 +20,10 @@ scope.onmessage = ({ data }) => {
   try {
     const source = new BufferGeometry();
     source.setAttribute("position", new BufferAttribute(data.positions, 3));
-    const { geometry, summary } = repairMesh(source, data.settings);
+    const { geometry, summary, generatedFaces } = repairMesh(source, data.settings);
     const flat = geometry.index ? geometry.toNonIndexed() : geometry;
     const positions = new Float32Array(flat.getAttribute("position").array);
-    scope.postMessage({ id: data.id, positions, summary }, [positions.buffer]);
+    scope.postMessage({ id: data.id, positions, generatedFaces, summary }, [positions.buffer, generatedFaces.buffer]);
   } catch (error) {
     scope.postMessage({ id: data.id, error: error instanceof Error ? error.message : "Mesh repair failed." });
   }

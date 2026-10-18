@@ -58,6 +58,8 @@ export interface RepairSummary {
 export interface RepairResult {
   geometry: BufferGeometry;
   summary: RepairSummary;
+  /** One entry per output triangle: 1 when the repair created it (hole patch or rim wall), else 0. */
+  generatedFaces: Uint8Array;
 }
 
 interface DirectedEdge {
@@ -160,6 +162,10 @@ export function threeMfScaleToMillimeters(data: ArrayBuffer): number {
   const scale = millimetersPerUnit[unit];
   if (scale === undefined) throw new Error(`Unsupported 3MF unit: ${unit}.`);
   return scale;
+}
+
+function faceCountOf(geometry: BufferGeometry): number {
+  return Math.floor((geometry.index?.count ?? geometry.getAttribute("position").count) / 3);
 }
 
 function getIndex(geometry: BufferGeometry, vertex: number): number {
@@ -265,10 +271,14 @@ export function inspectMesh(geometry: BufferGeometry): MeshReport {
   return topologyOf(geometry).report;
 }
 
-function removeDegenerateTriangles(geometry: BufferGeometry): BufferGeometry {
+function removeDegenerateTriangles(
+  geometry: BufferGeometry,
+  generated: Uint8Array,
+): { geometry: BufferGeometry; generated: Uint8Array } {
   const position = geometry.getAttribute("position");
   const topology = topologyOf(geometry);
   const kept: number[] = [];
+  const keptFlags: number[] = [];
   const indexCount = geometry.index?.count ?? position.count;
 
   for (let i = 0; i + 2 < indexCount; i += 3) {
@@ -284,6 +294,7 @@ function removeDegenerateTriangles(geometry: BufferGeometry): BufferGeometry {
       .cross(new Vector3().subVectors(topology.positions[c], topology.positions[a]))
       .length();
     if (area <= topology.tolerance ** 2) continue;
+    keptFlags.push(generated[i / 3]);
     kept.push(
       position.getX(ia), position.getY(ia), position.getZ(ia),
       position.getX(ib), position.getY(ib), position.getZ(ib),
@@ -291,12 +302,14 @@ function removeDegenerateTriangles(geometry: BufferGeometry): BufferGeometry {
     );
   }
 
-  return makePositionGeometry(kept);
+  return { geometry: makePositionGeometry(kept), generated: Uint8Array.from(keptFlags) };
 }
 
-function splitBoundaryComponents(geometry: BufferGeometry): {
+function splitBoundaryComponents(geometry: BufferGeometry, generated: Uint8Array): {
   open: BufferGeometry;
   closed: BufferGeometry;
+  openGenerated: Uint8Array;
+  closedGenerated: Uint8Array;
   openFaces: number;
 } {
   const topology = topologyOf(geometry);
@@ -342,8 +355,12 @@ function splitBoundaryComponents(geometry: BufferGeometry): {
   }
   const openTriangles: number[] = [];
   const closedTriangles: number[] = [];
+  const openFlags: number[] = [];
+  const closedFlags: number[] = [];
   for (let face = 0; face < faceCount; face++) {
-    const destination = openRoots.has(find(face)) ? openTriangles : closedTriangles;
+    const isOpen = openRoots.has(find(face));
+    const destination = isOpen ? openTriangles : closedTriangles;
+    (isOpen ? openFlags : closedFlags).push(generated[face]);
     for (let corner = 0; corner < 3; corner++) {
       const vertex = getIndex(geometry, face * 3 + corner);
       destination.push(position.getX(vertex), position.getY(vertex), position.getZ(vertex));
@@ -352,15 +369,19 @@ function splitBoundaryComponents(geometry: BufferGeometry): {
   return {
     open: makePositionGeometry(openTriangles),
     closed: makePositionGeometry(closedTriangles),
+    openGenerated: Uint8Array.from(openFlags),
+    closedGenerated: Uint8Array.from(closedFlags),
     openFaces: openTriangles.length / 9,
   };
 }
 
+// Offset shells inherit each source face's flag; the walls joining open rims are new.
 function thickenSurface(
   geometry: BufferGeometry,
+  generated: Uint8Array,
   thicknessMm: number,
   side: RepairSettings["surfaceSide"],
-): BufferGeometry {
+): { geometry: BufferGeometry; generated: Uint8Array } {
   if (!geometry.getAttribute("position") || geometry.getAttribute("position").count < 3) {
     throw new Error("Surface thickening needs at least one triangle.");
   }
@@ -368,7 +389,7 @@ function thickenSurface(
   if (!working.index) {
     const indexed = mergeVertices(working, 1e-7);
     working.dispose();
-    return thickenSurface(indexed, thicknessMm, side);
+    return thickenSurface(indexed, generated, thicknessMm, side);
   }
   working.computeBoundingBox();
   working.computeVertexNormals();
@@ -398,24 +419,26 @@ function thickenSurface(
   const outer = topology.positions.map((point, id) => point.clone().addScaledVector(normals[id], outerDistance));
   const inner = topology.positions.map((point, id) => point.clone().addScaledVector(normals[id], innerDistance));
   const positions: number[] = [];
-  const pushTriangle = (a: Vector3, b: Vector3, c: Vector3) => {
+  const flags: number[] = [];
+  const pushTriangle = (a: Vector3, b: Vector3, c: Vector3, flag: number) => {
     positions.push(a.x, a.y, a.z, b.x, b.y, b.z, c.x, c.y, c.z);
+    flags.push(flag);
   };
   for (let i = 0; i + 2 < index.count; i += 3) {
     const a = topology.ids[index.getX(i)];
     const b = topology.ids[index.getX(i + 1)];
     const c = topology.ids[index.getX(i + 2)];
-    pushTriangle(outer[a], outer[b], outer[c]);
-    pushTriangle(inner[c], inner[b], inner[a]);
+    pushTriangle(outer[a], outer[b], outer[c], generated[i / 3]);
+    pushTriangle(inner[c], inner[b], inner[a], generated[i / 3]);
   }
   for (const { start, end } of topology.boundary) {
-    pushTriangle(outer[start], outer[end], inner[end]);
-    pushTriangle(outer[start], inner[end], inner[start]);
+    pushTriangle(outer[start], outer[end], inner[end], 1);
+    pushTriangle(outer[start], inner[end], inner[start], 1);
   }
   working.dispose();
   const result = makePositionGeometry(positions);
   result.computeVertexNormals();
-  return result;
+  return { geometry: result, generated: Uint8Array.from(flags) };
 }
 
 export function repairMesh(
@@ -423,6 +446,7 @@ export function repairMesh(
   settings: RepairSettings = DEFAULT_SETTINGS,
 ): RepairResult {
   let geometry = source.clone();
+  let generated: Uint8Array = new Uint8Array(faceCountOf(source));
   const original = topologyOf(source).report;
   if (settings.weldVertices) {
     geometry = mergeVertices(geometry, Math.max(settings.weldTolerance, 1e-9));
@@ -430,7 +454,7 @@ export function repairMesh(
   const afterWeld = topologyOf(geometry).report;
   const weldedVertices = Math.max(0, original.vertices - afterWeld.vertices);
   const beforeDegenerateRemoval = afterWeld.triangles;
-  if (settings.removeDegenerate) geometry = removeDegenerateTriangles(geometry);
+  if (settings.removeDegenerate) ({ geometry, generated } = removeDegenerateTriangles(geometry, generated));
   const removedTriangles = Math.max(0, beforeDegenerateRemoval - topologyOf(geometry).report.triangles);
   let cappedHoles = 0;
   let cappedBoundaryEdges = 0;
@@ -439,8 +463,9 @@ export function repairMesh(
   let fallbackHoles = 0;
   const skippedHoles: SkippedHole[] = [];
   let thickenedFaces = 0;
-  const closeHoles = (target: BufferGeometry) => {
-    if (!settings.closeHoles) return target;
+  // fillHoles keeps the input faces in order and appends its patches after them.
+  const closeHoles = (target: BufferGeometry, flags: Uint8Array): [BufferGeometry, Uint8Array] => {
+    if (!settings.closeHoles) return [target, flags];
     const result = fillHoles(target, {
       method: settings.holeFillMethod,
       maxHoleEdges: Math.floor(settings.maxHoleEdges),
@@ -454,23 +479,29 @@ export function repairMesh(
     preservedRims += result.preservedRims;
     fallbackHoles += result.fallbackHoles;
     skippedHoles.push(...result.skippedHoles);
-    if (result.geometry !== target) target.dispose();
-    return result.geometry;
+    if (result.geometry === target) return [target, flags];
+    target.dispose();
+    const extended = new Uint8Array(faceCountOf(result.geometry)).fill(1);
+    extended.set(flags);
+    return [result.geometry, extended];
   };
 
   if (settings.addWallThickness && settings.thicknessScope === "single-sided") {
-    const split = splitBoundaryComponents(geometry);
+    const split = splitBoundaryComponents(geometry, generated);
     geometry.dispose();
     if (split.openFaces > 0) {
-      const selected = closeHoles(split.open);
-      const thickened = thickenSurface(selected, settings.wallThicknessMm, settings.surfaceSide);
+      const [selected, selectedFlags] = closeHoles(split.open, split.openGenerated);
+      const thickened = thickenSurface(selected, selectedFlags, settings.wallThicknessMm, settings.surfaceSide);
       thickenedFaces = Math.floor(selected.getAttribute("position").count / 3);
       selected.dispose();
-      const unchanged = split.closed.getAttribute("position").count > 0
-        ? closeHoles(split.closed)
-        : split.closed;
+      const [unchanged, unchangedFlags] = split.closed.getAttribute("position").count > 0
+        ? closeHoles(split.closed, split.closedGenerated)
+        : [split.closed, split.closedGenerated];
+      generated = new Uint8Array(unchangedFlags.length + thickened.generated.length);
+      generated.set(unchangedFlags);
+      generated.set(thickened.generated, unchangedFlags.length);
       const positions: number[] = [];
-      for (const component of [unchanged, thickened]) {
+      for (const component of [unchanged, thickened.geometry]) {
         const attribute = component.getAttribute("position");
         for (let vertex = 0; vertex < attribute.count; vertex++) {
           positions.push(attribute.getX(vertex), attribute.getY(vertex), attribute.getZ(vertex));
@@ -479,16 +510,16 @@ export function repairMesh(
       }
       geometry = makePositionGeometry(positions);
     } else {
-      geometry = closeHoles(split.closed);
+      [geometry, generated] = closeHoles(split.closed, split.closedGenerated);
       split.open.dispose();
     }
   } else {
-    geometry = closeHoles(geometry);
+    [geometry, generated] = closeHoles(geometry, generated);
     if (settings.addWallThickness) {
-      thickenedFaces = Math.floor((geometry.index?.count ?? geometry.getAttribute("position").count) / 3);
-      const thickened = thickenSurface(geometry, settings.wallThicknessMm, settings.surfaceSide);
+      thickenedFaces = faceCountOf(geometry);
+      const thickened = thickenSurface(geometry, generated, settings.wallThicknessMm, settings.surfaceSide);
       geometry.dispose();
-      geometry = thickened;
+      ({ geometry, generated } = thickened);
     }
   }
   geometry.computeVertexNormals();
@@ -512,7 +543,7 @@ export function repairMesh(
     surfaceSide: settings.surfaceSide,
     changed: true,
   };
-  return { geometry, summary };
+  return { geometry, summary, generatedFaces: generated };
 }
 
 export function boundsOf(geometry: BufferGeometry): Vector3 {
